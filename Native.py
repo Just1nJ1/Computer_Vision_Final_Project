@@ -6,8 +6,9 @@ from torch.xpu import device
 from torchvision import models
 from torchvision.models import VGG16_Weights
 
-# device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-device = torch.device('mps')
+device = torch.device("cuda" if torch.cuda.is_available() else
+                      "mps" if torch.backends.mps.is_available() else
+                      "cpu")
 print(device)
 num_epochs = 5
 batch_size = 40
@@ -39,7 +40,6 @@ test_loader = torch.utils.data.DataLoader(test_dataset
 n_total_step = len(train_loader)
 print(n_total_step)
 
-# model = models.vgg16(pretrained = True)
 model = models.vgg16(weights=VGG16_Weights.IMAGENET1K_V1)
 input_lastLayer = model.classifier[6].in_features
 model.classifier[6] = nn.Linear(input_lastLayer,10)
