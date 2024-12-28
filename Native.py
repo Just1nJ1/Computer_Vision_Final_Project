@@ -2,13 +2,13 @@ import torch
 import torch.nn as nn
 import torchvision
 import torchvision.transforms as transforms
-from torch.xpu import device
 from torchvision import models
 from torchvision.models import VGG16_Weights
 
 device = torch.device("cuda" if torch.cuda.is_available() else
                       "mps" if torch.backends.mps.is_available() else
                       "cpu")
+
 print(device)
 num_epochs = 5
 batch_size = 40
@@ -45,7 +45,7 @@ input_lastLayer = model.classifier[6].in_features
 model.classifier[6] = nn.Linear(input_lastLayer,10)
 model = model.to(device)
 criterion = nn.CrossEntropyLoss()
-optimizer = torch.optim.SGD(model.parameters(), lr = learning_rate, momentum=0.9,weight_decay=5e-4)
+optimizer = torch.optim.SGD(model.parameters(), lr=learning_rate, momentum=0.9,weight_decay=5e-4)
 
 for epoch in range(num_epochs):
     for i, (imgs, labels) in enumerate(train_loader):

@@ -81,17 +81,28 @@ class VGG16Modified(torch.nn.Module):
                 print(f"Layer: {name} | Trainable")
 
 
-def custom_entropy(task_predictions, honeypot_predictions, targets, true_label, c=0.05):
-    targets = F.one_hot(targets, 10)
+def custom_entropy(task_predictions, honeypot_predictions, targets, true_label, c=0.05, num_classes=10, prev_L_CETask_mean=None):
+    targets = F.one_hot(targets, num_classes)
 
     task_predictions = torch.softmax(task_predictions, dim=1)
     honeypot_predictions = torch.softmax(honeypot_predictions, dim=1)
+    
+    epsilon = 1e-8
+    L_CEHoneypot = (-targets * torch.log(task_predictions + epsilon)).mean(dim=1)
+    L_CETask = (-targets * torch.log(honeypot_predictions + epsilon)).mean(dim=1)
+    L_CETask_mean = torch.mean(L_CETask).clamp(min=epsilon)
 
-    L_CEHoneypot = (-targets * torch.log(task_predictions)).mean(dim=1)
-    L_CETask = (-targets * torch.log(honeypot_predictions)).mean(dim=1)
-    L_CETask_mean = torch.mean(L_CETask)
+    if prev_L_CETask_mean is not None:
+        prev_L_CETask_mean[:-1] = prev_L_CETask_mean[1:].clone().detach()
+        prev_L_CETask_mean[-1] = L_CETask_mean.detach()
+        L_CETask_mean = torch.mean(prev_L_CETask_mean)
+    
+    # L_CEHoneypot = (-targets * torch.log(task_predictions)).mean(dim=1)
+    # L_CETask = (-targets * torch.log(honeypot_predictions)).mean(dim=1)
+    # L_CETask_mean = torch.mean(L_CETask)
     W_x = L_CEHoneypot / L_CETask_mean
 
+    # L_WCE = torch.sigmoid(W_x - min(c, torch.mean(W_x).item())) * L_CETask
     L_WCE = torch.sigmoid(W_x - c) * L_CETask
     loss = L_WCE.sum()
 
@@ -109,72 +120,138 @@ def custom_entropy(task_predictions, honeypot_predictions, targets, true_label, 
     return loss, total_poisoned, successful_attacks
 
 
-def train(name, model, device, train_loader, optimizer, epochs, verbose=False):
-    criterion = custom_entropy
-    model.to(device)
-    model.train()
-    model.freeze()
-    step_losses = []
-    ASR = []
+def train(args):
+    name = args.name
+    model = args.model
+    device = args.device
+    train_loader = args.train_loader
+    val_loader = args.val_loader
+    optimizer = args.optimizer
+    epochs = args.epochs
+    path = args.result_path
 
-    if verbose:
-        pass
+    criterion = custom_entropy
+    prev_L_CETask_mean = torch.zeros(args.t, requires_grad=False).to(device)
+    model.to(device)
+    model.freeze()
+
+    train_losses = []
+    train_accs = []
+    train_ASRs = []
+    val_accs = []
+    val_ASRs = []
+
+    lowest_asr = 1
 
     step_count = 0
     for epoch in range(epochs):
+        model.train()
         start_time = time.time()
-        running_loss = 0.0
+
+        num_poisoned = 0
+        num_successful_attacks = 0
+
+        for images, labels, true_label in (pbar := tqdm(train_loader, desc=f"Epoch {epoch + 1}/{epochs}", unit="batch")):
+            images, labels, true_label = images.to(device), labels.to(device), true_label.to(device)
+            real_labels = torch.where(true_label != -1, true_label, labels)
+
+            task, honeypot = model(images)
+
+            loss, total_poisoned, successful_attacks = criterion(task, honeypot, labels, true_label, num_classes=args.num_classes, prev_L_CETask_mean=prev_L_CETask_mean)
+            
+            if torch.isnan(loss):
+                print("NaN loss detected!")
+                break
+                
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            accuracy = task.argmax(axis=1).eq(real_labels).sum().item() / labels.size(0)
+
+            train_losses.append(loss.item())
+            train_accs.append(accuracy)
+
+            num_poisoned += total_poisoned
+            num_successful_attacks += successful_attacks
+
+            step_count += 1
+
+            if step_count == args.warmup_steps:
+                model.unfreeze()
+
+            # Update tqdm progress bar
+            pbar.set_postfix({
+                "Loss": f"{loss:.4f}",
+                "Accuracy": f"{accuracy:.4f}",
+                "ASR": f"{num_successful_attacks / num_poisoned:.4f}"
+            })
+
+        # Calculate epoch metrics
+        epoch_time = time.time() - start_time
+        throughput = len(train_loader.dataset) / epoch_time
+        train_ASRs.append(num_successful_attacks / num_poisoned)
+
+        model.eval()
         correct = 0
         num_poisoned = 0
         num_successful_attacks = 0
-        total_images = 0
-
-        with tqdm(train_loader, desc=f"Epoch {epoch + 1}/{epochs}", unit="batch") as pbar:
-            for images, labels, true_label in pbar:
+        total = 0
+        with torch.no_grad():
+            for images, labels, true_label in tqdm(val_loader, desc=f"Epoch {epoch + 1}/{epochs} Validation"):
                 images, labels, true_label = images.to(device), labels.to(device), true_label.to(device)
+                real_labels = torch.where(true_label != -1, true_label, labels)
+                
                 task, honeypot = model(images)
-
                 loss, total_poisoned, successful_attacks = criterion(task, honeypot, labels, true_label)
-                loss.backward()
-                optimizer.step()
-                optimizer.zero_grad()
 
-                # Store the step loss in the list
-                step_losses.append(loss.item())
-
-                # Update metrics
-                correct += task.argmax(axis=1).eq(labels).sum().item()
-                running_loss += loss.item() * images.size(0)
-                total_images += images.size(0)
+                correct += task.argmax(axis=1).eq(real_labels).sum().item()
                 num_poisoned += total_poisoned
                 num_successful_attacks += successful_attacks
-                step_count += 1
+                total += images.size(0)
 
-                if step_count == 1000:
-                    model.unfreeze()
-                    if verbose:
-                        pass
+        val_accuracy = correct / total
+        val_ASR = num_successful_attacks / num_poisoned
 
-                # Update tqdm progress bar
-                pbar.set_postfix({
-                    "Loss": f"{running_loss / total_images:.4f}",
-                    "Acc": f"{correct / total_images:.4f}",
-                    "ASR": f"{num_successful_attacks / num_poisoned:.4f}"
-                })
+        val_accs.append(val_accuracy)
+        val_ASRs.append(val_ASR)
 
-        # Calculate epoch metrics
-        epoch_loss = running_loss / len(train_loader.dataset)
-        epoch_accuracy = correct / len(train_loader.dataset)
-        epoch_time = time.time() - start_time
-        throughput = len(train_loader.dataset) / epoch_time  # Images per second
-        ASR.append(num_successful_attacks / num_poisoned)
+        if val_ASR < lowest_asr:
+            lowest_asr = val_ASR
+            torch.save(model.state_dict(), f'{args.ckpt_path}/{args.name}_{args.task}_best.pth')
 
         print(
             f"Epoch [{epoch + 1}/{epochs}], "
-            f"Loss: {epoch_loss:.4f}, "
-            f"Accuracy: {epoch_accuracy:.4f}, "
-            f"Throughput: {throughput:.2f} images/sec"
+            f"Throughput: {throughput:.2f} images/sec, "
+            f"Validation Accuracy: {val_accuracy:.4f}, "
+            f"Validation ASR: {val_ASR:.4f}"
         )
 
-    store_csv(step_losses, f"{name}_step_loss")
-    store_csv(ASR, f"{name}_ASR")
+        print(f"Lowest ASR: {lowest_asr:.4f}")
+
+        store_csv(train_losses, f"{name}_train_loss", path)
+        store_csv(train_accs, f"{name}_train_accs", path)
+        store_csv(train_ASRs, f"{name}_train_ASRs", path)
+        store_csv(val_accs, f"{name}_val_accs", path)
+        store_csv(val_ASRs, f"{name}_val_ASRs", path)
+
+        train_losses = []
+        train_accs = []
+        train_ASRs = []
+        val_accs = []
+        val_ASRs = []
+
+    # from datetime import datetime
+    # from zoneinfo import ZoneInfo
+    #
+    # eastern = ZoneInfo("America/New_York")
+    #
+    # current_datetime = datetime.now(eastern)
+    #
+    # formatted_datetime = current_datetime.strftime("%Y-%m-%d_%H:%M")
+    #
+    # store_csv(train_losses, f"{formatted_datetime} - {name}_Honeypot_train_loss", path)
+    # store_csv(train_accs, f"{formatted_datetime} - {name}_Honeypot_train_accs", path)
+    # store_csv(train_ASRs, f"{formatted_datetime} - {name}_Honeypot_train_ASRs", path)
+    # store_csv(val_accs, f"{formatted_datetime} - {name}_Honeypot_val_accs", path)
+    # store_csv(val_ASRs, f"{formatted_datetime} - {name}_Honeypot_val_ASRs", path)

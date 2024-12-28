@@ -6,9 +6,19 @@ from torchvision import datasets
 
 # Backdoor dataset
 class CIFAR10Backdoor(Dataset):
-    def __init__(self, root, train=True, pre_transform=None, post_transform=None, trigger_color=0, poison_rate=0.05,
-                 target_class=0, lamda=0.2):
-        self.dataset = datasets.CIFAR10(root=root, train=train, download=True)
+    def __init__(self, args, train=True, pre_transform = None, post_transform = None):
+        root = args.data_path
+        trigger_color = args.trigger_color
+        poison_rate = args.poison_rate
+        target_class = args.target_label
+        lamda = args.lamda
+        assert args.dataset in ['CIFAR10', 'CIFAR100']
+        if args.dataset == 'CIFAR10':
+            self.dataset = datasets.CIFAR10(root=root, train=train, download=True)
+        elif args.dataset == 'CIFAR100':
+            self.dataset = datasets.CIFAR100(root=root, train=train, download=True)
+        else:
+            assert False, 'Unsupported dataset'
         self.pre_transform = pre_transform
         self.post_transform = post_transform
         self.poison_rate = poison_rate
